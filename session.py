@@ -6,288 +6,150 @@ import socket
 import time
 from dataclasses import dataclass
 from typing import Optional
+from enum import Enum
+import secrets
 
 from ntfy import ntfy_get_latest_peer, ntfy_publish
-from stun import discover_public_endpoint
+from stun import discover_public_endpoint, NATType
 
 log = logging.getLogger("p2p")
 
-POLL_INTERVAL = 10.0
-ANNOUNCE_INTERVAL = 10.0
+PEER_ADDRESS_FETCH_INTERVAL = 5
+MAX_PEER_ADDRESS_RESOLUTIONS = float("inf")
+MAX_PUNCH_ATTEMPTS = float("inf")
+PUNCH_INTERVAL = 10
+PEER_RECV_TIMEOUT = 0.5
 
-PUNCH_RETRY_INTERVAL = 0.5
-# Generous: mobile/carrier-grade NAT often needs more than one round trip
-# before the return path opens, so a short deadline here just means we give
-# up on a perfectly good candidate address too early.
-PUNCH_ATTEMPT_TIMEOUT = 10.0
-
-# Heartbeat keeps the "connected" phase honest so we can detect a dead link
-# without ever going back to bursty punching while things are still working.
-HEARTBEAT_INTERVAL = 5.0
-HEARTBEAT_TIMEOUT = 20.0
-
-# How often to send an application-level message once connected. Runs
-# indefinitely until the connection drops or the process is interrupted.
-MESSAGE_INTERVAL = 1.0
-
-RECV_TICK = 0.5  # how long each loop iteration blocks waiting for a packet
+PREFIX_PING = "PING"
+PREFIX_PONG = "PONG"
+PREFIX_ACK = "ACK"
 
 
-# ----------------------------------------------------------------------
-# WIRE PROTOCOL
-# ----------------------------------------------------------------------
-# PING:<user>:<nonce>   - punch/heartbeat probe, always answered with PONG
-# PONG:<nonce>          - reply to a PING, matched against a pending nonce
-# MSG:<user>:<text>     - application message, always answered with ACK
-# ACK:<text>            - acknowledgement of a MSG
-#
-# UDP doesn't guarantee delivery, so we don't insist on the *exact* PONG
-# that answers our *exact* PING to declare the link up. Any packet from the
-# address we're trying to reach (while seeking/punching) is proof the path
-# is open in both directions, so it's treated as a connection confirmation
-# too. The nonce match is kept as a slightly faster/tighter path, not the
-# only path.
+class SessionState(int, Enum):
+    SELF_DISCOVERY = 0
+    PEER_DISCOVERY = 1
+    UDP_PUNCH = 2
+    CONNECTED = 3
 
-def send_ping(sock: socket.socket, addr: tuple[str, int], username: str, nonce: str) -> None:
-    try:
-        sock.sendto(f"PING:{username}:{nonce}".encode(), addr)
-    except OSError:
-        pass
-
-
-def send_pong(sock: socket.socket, addr: tuple[str, int], nonce: str) -> None:
-    try:
-        sock.sendto(f"PONG:{nonce}".encode(), addr)
-    except OSError:
-        pass
-
-
-def send_message(sock: socket.socket, addr: tuple[str, int], username: str, message: str) -> None:
-    try:
-        sock.sendto(f"MSG:{username}:{message}".encode(), addr)
-        log.info("SENT -> %s:%d: %s", *addr, message)
-    except OSError:
-        pass
-
-
-def send_ack(sock: socket.socket, addr: tuple[str, int], message: str) -> None:
-    try:
-        sock.sendto(f"ACK:{message}".encode(), addr)
-    except OSError:
-        pass
-
-
-# ----------------------------------------------------------------------
-# SESSION STATE MACHINE
-#
-#   seeking   -> waiting on ntfy for the peer's current endpoint
-#   punching  -> bursting PINGs at a known endpoint, trying to open the NAT
-#   connected -> link is up; no punching, just a slow heartbeat for liveness
-#
-# Punching only ever happens on entry to "seeking" finding a peer, or when
-# the heartbeat in "connected" times out and we fall back to "seeking".
-# Incoming PINGs are answered unconditionally in every phase.
-# ----------------------------------------------------------------------
 
 @dataclass
 class Session:
-    username: str
+    sock: socket.socket
+
+    my_username: str
     my_topic: str
     peer_username: str
     peer_topic: str
 
-    phase: str = "seeking"
-    peer_addr: Optional[tuple[str, int]] = None
-    last_polled_peer: Optional[tuple[str, int]] = None
+    my_ip: str | None = None
+    my_port: int | None = None
+    my_nat_type: NATType | None = None
+    peer_ip: str | None = None
+    peer_port: int | None = None
 
-    pending_nonce: Optional[str] = None
-    punch_deadline: float = 0.0
-    next_punch_send: float = 0.0
+    ping_id: str | None = None
 
-    last_rx: float = 0.0
-    next_heartbeat: float = 0.0
-    next_message: float = 0.0
-    message_counter: int = 0
-
-    next_announce: float = 0.0
-    next_poll: float = 0.0
+    state: SessionState = SessionState.SELF_DISCOVERY
 
 
-def _confirm_connection(session: Session, addr: tuple[str, int], source: str) -> None:
-    """Mark the session connected because we heard *something* back from
-    the address we're trying to reach. Called from every packet branch
-    below, not just PONG, since any inbound packet is equally good proof
-    the path is open."""
-    now = time.time()
-    session.phase = "connected"
-    session.peer_addr = addr
-    session.pending_nonce = None
-    session.last_rx = now
-    session.next_heartbeat = now + HEARTBEAT_INTERVAL
-    session.next_message = now + MESSAGE_INTERVAL
-    log.info("Direct P2P connection established with %s (confirmed via %s)", session.peer_username, source)
+def discover_self(session: Session) -> Session:
+    log.info(f"Getting own public address...")
+    stun, nat_type = discover_public_endpoint(session.sock, True)
+    session.my_nat_type = nat_type
+    session.my_ip, session.my_port = stun.ip, stun.port
+    return session
 
 
-def handle_packet(sock: socket.socket, session: Session, data: bytes, addr: tuple[str, int]) -> None:
-    text = data.decode(errors="ignore")
+def discover_peer(session: Session) -> Session:
+    log.info(f"Getting {session.peer_username}'s address...")
+    no_attempts = 0
+    peer_address = None
+    while peer_address is None and no_attempts < MAX_PEER_ADDRESS_RESOLUTIONS:
+        peer_address = ntfy_get_latest_peer(session.peer_topic, session.peer_username)
+        no_attempts += 1
+        if peer_address is None:
+            log.info(f"Attempt:{no_attempts} Could not get peer's address.")
+            time.sleep(PEER_ADDRESS_FETCH_INTERVAL)
+            continue
 
-    # Any packet from the address we're currently trying to reach counts as
-    # proof the path is open, while we're still trying to establish it.
-    trying_this_addr = session.phase in ("seeking", "punching") and addr == session.peer_addr
+    if peer_address is None:
+        return session
 
-    if text.startswith("PING:"):
-        parts = text.split(":", 2)
-        if len(parts) == 3:
-            _, their_user, their_nonce = parts
-            log.info("Received PING from %s (%s:%d)", their_user, *addr)
-            send_pong(sock, addr, their_nonce)  # always answer, regardless of phase
-            if trying_this_addr:
-                _confirm_connection(session, addr, "PING")
-            elif session.phase == "connected" and addr == session.peer_addr:
-                session.last_rx = time.time()
-        return
-
-    if text.startswith("PONG:"):
-        if trying_this_addr:
-            log.info("Received PONG from %s:%d", *addr)
-            _confirm_connection(session, addr, "PONG")
-        return
-
-    if text.startswith("MSG:"):
-        parts = text.split(":", 2)
-        if len(parts) == 3:
-            _, their_user, message = parts
-            log.info("RECEIVED <- %s:%d [%s]: %s", *addr, their_user, message)
-            send_ack(sock, addr, message)
-            if trying_this_addr:
-                _confirm_connection(session, addr, "MSG")
-            elif session.phase == "connected" and addr == session.peer_addr:
-                session.last_rx = time.time()
-        return
-
-    if text.startswith("ACK:"):
-        if trying_this_addr:
-            _confirm_connection(session, addr, "ACK")
-        elif session.phase == "connected" and addr == session.peer_addr:
-            session.last_rx = time.time()
-        return
+    session.peer_ip = peer_address[0]
+    session.peer_port = peer_address[1]
+    return session
 
 
-def start_punch(session: Session, peer_addr: tuple[str, int]) -> None:
-    now = time.time()
-    session.phase = "punching"
-    session.peer_addr = peer_addr
-    session.pending_nonce = str(random.randint(0, 1_000_000))
-    session.punch_deadline = now + PUNCH_ATTEMPT_TIMEOUT
-    session.next_punch_send = 0.0
-    log.info("Punching %s:%d", *peer_addr)
+def punch_udp_hole(session: Session) -> Session:
+    log.info("Punching...")
+    session.sock.connect((session.peer_ip, session.peer_port))
+    session.sock.settimeout(PEER_RECV_TIMEOUT)
 
+    if session.ping_id is None:
+        session.ping_id = secrets.token_hex(12)
 
-def drop_connection(session: Session, reason: str) -> None:
-    log.warning("Connection to %s lost (%s)", session.peer_username, reason)
-    session.phase = "seeking"
-    session.peer_addr = None
-    session.pending_nonce = None
-    # Forget the last address we punched so a fresh ntfy poll re-triggers a
-    # punch attempt even if the peer's endpoint hasn't actually changed.
-    session.last_polled_peer = None
+    deadline = time.monotonic() + MAX_PUNCH_ATTEMPTS * PUNCH_INTERVAL
+    next_ping = 0.0
 
+    while time.monotonic() < deadline:
+        now = time.monotonic()
 
-def tick(sock: socket.socket, session: Session) -> None:
-    now = time.time()
+        if now >= next_ping:
+            discover_peer(session)
+            session.sock.connect((session.peer_ip, session.peer_port))
+            log.info("Re-published own address.")
 
-    # Keep our own published endpoint fresh regardless of phase (cheap, quiet).
-    if now >= session.next_announce:
+            session.sock.send(f"{PREFIX_PING}:{session.ping_id}".encode("utf-8"))
+            log.info("Sent new ping.")
+            next_ping = now + PUNCH_INTERVAL
+
         try:
-            endpoint, nat_type = discover_public_endpoint(sock, quiet=True)
-            ntfy_publish(
-                session.my_topic,
-                {"user": session.username, "ip": endpoint.ip, "port": endpoint.port, "nat_type": nat_type},
-                quiet=True,
-            )
-        except RuntimeError as exc:
-            log.warning("Endpoint refresh failed: %s", exc)
-        session.next_announce = now + ANNOUNCE_INTERVAL
-
-    # Poll the peer's published endpoint unconditionally, in every phase -
-    # not just while "seeking". Any time the address on ntfy differs from
-    # whatever we last acted on, treat it as authoritative and re-punch
-    # immediately, even if we're already mid-punch or fully connected. This
-    # covers a peer picking up a stale/incorrect endpoint from an earlier
-    # publish, or the local NAT remapping the external port mid-session.
-    if now >= session.next_poll:
-        peer = ntfy_get_latest_peer(session.peer_topic, session.peer_username)
-        session.next_poll = time.time() + POLL_INTERVAL
-
-        if peer is not None and peer != session.last_polled_peer:
-            session.last_polled_peer = peer
-            log.info("Peer endpoint changed -> %s:%d (phase was %s)", peer[0], peer[1], session.phase)
-            start_punch(session, peer)
-            return  # phase just changed to "punching"; nothing else to do this tick
-
-    if session.phase == "punching":
-        if now >= session.punch_deadline:
-            log.warning(
-                "No confirmation yet from %s:%d after %.0fs, retrying via ntfy", *session.peer_addr, PUNCH_ATTEMPT_TIMEOUT
-            )
-            session.phase = "seeking"
-            session.pending_nonce = None
-            # Deliberately keep peer_addr set: a PONG/PING/MSG that was in
-            # flight when the deadline hit should still be recognized as a
-            # connection confirmation if it arrives a moment later.
-            # Also forget last_polled_peer so the next poll (even if the
-            # peer's address is unchanged) is treated as "new" and
-            # re-triggers a punch attempt instead of sitting idle.
-            session.last_polled_peer = None
-        elif now >= session.next_punch_send:
-            send_ping(sock, session.peer_addr, session.username, session.pending_nonce)
-            session.next_punch_send = now + PUNCH_RETRY_INTERVAL
-
-    elif session.phase == "connected":
-        if now - session.last_rx > HEARTBEAT_TIMEOUT:
-            drop_connection(session, "heartbeat timeout")
-            return
-
-        if now >= session.next_message:
-            session.message_counter += 1
-            send_message(sock, session.peer_addr, session.username, f"hello-{session.message_counter}")
-            session.next_message = now + MESSAGE_INTERVAL
-
-        if now >= session.next_heartbeat:
-            # Liveness probe only - not a punch burst. Peer answers it via the
-            # unconditional PING handler above.
-            send_ping(sock, session.peer_addr, session.username, "heartbeat")
-            session.next_heartbeat = now + HEARTBEAT_INTERVAL
-
-
-def run_session(
-    sock: socket.socket,
-    username: str,
-    my_topic: str,
-    peer_username: str,
-    peer_topic: str,
-    initial_connect_timeout: float,
-) -> bool:
-    session = Session(username=username, my_topic=my_topic, peer_username=peer_username, peer_topic=peer_topic)
-
-    connect_deadline = time.time() + initial_connect_timeout
-    ever_connected = False
-
-    sock.settimeout(RECV_TICK)
-
-    while True:
-        try:
-            data, addr = sock.recvfrom(4096)
-            handle_packet(sock, session, data, addr)
+            message = session.sock.recv(2048)
         except socket.timeout:
-            pass
+            continue
 
-        tick(sock, session)
+        payload = message.decode("utf-8", errors="replace")
+        if payload.startswith(PREFIX_PING):
+            peer_ping_id = payload.split(":", 1)[1]
+            if session.peer_username < session.my_username:
+                session.ping_id = peer_ping_id
 
-        if session.phase == "connected":
-            ever_connected = True
-        elif not ever_connected and time.time() >= connect_deadline:
-            log.warning("Timed out waiting for initial connection to %s", peer_username)
-            return False
-        # Once connected, the session runs indefinitely (reconnecting on
-        # failure via "seeking" -> "punching") until interrupted.
+            session.sock.send(f"{PREFIX_PONG}:{session.ping_id}".encode("utf-8"))
+            log.info("Recived ping, sent pong.")
+
+        elif payload.startswith(PREFIX_PONG):
+            log.info("Recived pong.")
+            pong_id = payload.split(":", 1)[1]
+            if pong_id != session.ping_id:
+                log.info("Pong does not match the ping id.")
+                continue
+
+            session.sock.send(f"{PREFIX_ACK}:{pong_id}".encode("utf-8"))
+            log.info("Sent ACK.")
+            session.state = SessionState.CONNECTED
+            return session
+
+        elif payload.startswith(PREFIX_ACK):
+            log.info("Recived ACK.")
+            ack_id = payload.split(":", 1)[1]
+            if ack_id == session.ping_id:
+                session.state = SessionState.CONNECTED
+                return session
+            else:
+                log.info("ACK id does not match ping id.")
+
+    return session
+
+
+def run_session(session: Session) -> Session:
+    session = discover_self(session)
+    if session.my_nat_type == NATType.SYMMETRIC:
+        log.error("Symmetric NAT detected, punching is not possible.")
+        return False
+
+    session.state = SessionState.PEER_DISCOVERY
+    session = discover_peer(session)
+
+    session.state = SessionState.UDP_PUNCH
+    session = punch_udp_hole(session)
+    return session

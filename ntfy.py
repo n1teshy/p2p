@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import hashlib
 import json
 import logging
@@ -35,26 +33,24 @@ def ntfy_publish(topic: str, payload: dict, quiet: bool = False) -> None:
         log.info("Published endpoint %s:%s", payload["ip"], payload["port"])
 
 
-def ntfy_get_latest_peer(topic: str, expected_user: str) -> Optional[tuple[str, int]]:
+def ntfy_get_latest_peer(
+    topic: str, expected_username: str
+) -> Optional[tuple[str, int]]:
     url = f"{NTFY_BASE}/{topic}/json?poll=1&since=latest"
 
     try:
         request = urllib.request.Request(url)
 
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=3) as response:
             for line in response:
                 try:
-                    event = json.loads(line.decode())
+                    message = json.loads(line.decode())["message"]
+                    payload = json.loads(message)
                 except json.JSONDecodeError:
                     continue
 
-                if event.get("event") != "message":
-                    continue
-
                 try:
-                    payload = json.loads(event.get("message", ""))
-
-                    if payload.get("user") != expected_user:
+                    if payload.get("username") != expected_username:
                         continue
 
                     return str(payload["ip"]), int(payload["port"])

@@ -1,12 +1,10 @@
-from __future__ import annotations
-
 import argparse
 import logging
 import socket
 import sys
 
 from ntfy import channel_for, ntfy_publish
-from session import run_session
+from session import run_session, Session, SessionState
 from stun import discover_public_endpoint
 
 log = logging.getLogger("p2p")
@@ -40,7 +38,16 @@ def main() -> int:
         log.info("Public endpoint: %s:%d (%s)", endpoint.ip, endpoint.port, nat_type)
 
         my_topic = channel_for(args.user)
-        ntfy_publish(my_topic, {"user": args.user, "ip": endpoint.ip, "port": endpoint.port, "nat_type": nat_type})
+        ntfy_publish(
+            my_topic,
+            {
+                "username": args.user,
+                "ip": endpoint.ip,
+                "port": endpoint.port,
+            },
+        )
+
+        log.info("Published my address.")
 
         peer_username = args.peer or input("Peer username: ").strip()
 
@@ -49,16 +56,29 @@ def main() -> int:
 
         peer_topic = channel_for(peer_username)
 
-        success = run_session(
+        session = Session(
             sock=sock,
-            username=args.user,
-            my_topic=my_topic,
+            my_username=args.user,
             peer_username=peer_username,
+            my_topic=my_topic,
             peer_topic=peer_topic,
-            initial_connect_timeout=args.timeout,
         )
 
-        return 0 if success else 1
+        session = run_session(session)
+        if not session.state == SessionState.CONNECTED:
+            log.error(f"Could not connect to {peer_username}")
+            return
+
+        for i in range(3):
+            message = f"{session.my_username}: hello-{i}"
+            session.sock.send(message.encode("utf-8"))
+            log.info(f'sent "{message}"')
+
+            try:
+                message = session.sock.recv(2048).decode("utf-8", errors="replace")
+                log.info(f'recived "{message}"')
+            except socket.timeout:
+                continue
 
     except (RuntimeError, OSError) as exc:
         log.error("Failed: %s", exc)

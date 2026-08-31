@@ -1,11 +1,10 @@
-from __future__ import annotations
-
 import logging
 import random
 import socket
 import struct
 from dataclasses import dataclass
 from typing import Optional
+from enum import Enum
 
 log = logging.getLogger("p2p")
 
@@ -24,6 +23,11 @@ ATTR_XOR_MAPPED_ADDRESS = 0x0020
 STUN_FAMILY_IPV4 = 0x01
 
 
+class NATType(int, Enum):
+    SYMMETRIC = 0
+    CONE = 1
+
+
 @dataclass
 class StunResult:
     ip: str
@@ -31,14 +35,20 @@ class StunResult:
 
 
 def build_stun_binding_request(transaction_id: bytes) -> bytes:
-    return struct.pack("!HHI12s", STUN_BINDING_REQUEST, 0, STUN_MAGIC_COOKIE, transaction_id)
+    return struct.pack(
+        "!HHI12s", STUN_BINDING_REQUEST, 0, STUN_MAGIC_COOKIE, transaction_id
+    )
 
 
-def extract_mapped_address_from_stun_response(data: bytes, transaction_id: bytes) -> Optional[StunResult]:
+def extract_mapped_address_from_stun_response(
+    data: bytes, transaction_id: bytes
+) -> Optional[StunResult]:
     if len(data) < 20:
         return None
 
-    message_type, attributes_length, magic_cookie, response_transaction_id = struct.unpack("!HHI12s", data[:20])
+    message_type, attributes_length, magic_cookie, response_transaction_id = (
+        struct.unpack("!HHI12s", data[:20])
+    )
 
     if (
         message_type != STUN_BINDING_SUCCESS
@@ -47,12 +57,12 @@ def extract_mapped_address_from_stun_response(data: bytes, transaction_id: bytes
     ):
         return None
 
-    attributes = data[20:20 + attributes_length]
+    attributes = data[20 : 20 + attributes_length]
     mapped_address = None
     offset = 0
 
     while offset + 4 <= len(attributes):
-        attr_type, attr_length = struct.unpack("!HH", attributes[offset:offset + 4])
+        attr_type, attr_length = struct.unpack("!HH", attributes[offset : offset + 4])
         start, end = offset + 4, offset + 4 + attr_length
 
         if end > len(attributes):
@@ -60,7 +70,11 @@ def extract_mapped_address_from_stun_response(data: bytes, transaction_id: bytes
 
         value = attributes[start:end]
 
-        if attr_type == ATTR_XOR_MAPPED_ADDRESS and len(value) >= 8 and value[1] == STUN_FAMILY_IPV4:
+        if (
+            attr_type == ATTR_XOR_MAPPED_ADDRESS
+            and len(value) >= 8
+            and value[1] == STUN_FAMILY_IPV4
+        ):
             xor_port = struct.unpack("!H", value[2:4])[0]
             port = xor_port ^ (STUN_MAGIC_COOKIE >> 16)
 
@@ -70,7 +84,11 @@ def extract_mapped_address_from_stun_response(data: bytes, transaction_id: bytes
 
             return StunResult(ip, port)
 
-        elif attr_type == ATTR_MAPPED_ADDRESS and len(value) >= 8 and value[1] == STUN_FAMILY_IPV4:
+        elif (
+            attr_type == ATTR_MAPPED_ADDRESS
+            and len(value) >= 8
+            and value[1] == STUN_FAMILY_IPV4
+        ):
             port = struct.unpack("!H", value[2:4])[0]
             ip = socket.inet_ntoa(value[4:8])
             mapped_address = StunResult(ip, port)
@@ -81,24 +99,30 @@ def extract_mapped_address_from_stun_response(data: bytes, transaction_id: bytes
     return mapped_address
 
 
-def stun_query(sock: socket.socket, host: str, port: int, timeout: float = 3.0) -> StunResult:
+def stun_query(sock: socket.socket, host: str, port: int) -> StunResult:
     transaction_id = bytes(random.getrandbits(8) for _ in range(12))
     request = build_stun_binding_request(transaction_id)
     server_ip = socket.gethostbyname(host)
 
-    sock.settimeout(timeout)
-    sock.sendto(request, (server_ip, port))
-    data, _ = sock.recvfrom(2048)
+    old_timeout = sock.gettimeout()
+    sock.settimeout(3)
+    try:
+        sock.sendto(request, (server_ip, port))
+        data, _ = sock.recvfrom(2048)
 
-    result = extract_mapped_address_from_stun_response(data, transaction_id)
+        result = extract_mapped_address_from_stun_response(data, transaction_id)
 
-    if result is None:
-        raise RuntimeError(f"STUN server {host}:{port} returned invalid response")
+        if result is None:
+            raise RuntimeError(f"STUN server {host}:{port} returned invalid response")
 
-    return result
+        return result
+    finally:
+        sock.settimeout(old_timeout)
 
 
-def discover_public_endpoint(sock: socket.socket, quiet: bool = False) -> tuple[StunResult, str]:
+def discover_public_endpoint(
+    sock: socket.socket, quiet: bool = False
+) -> tuple[StunResult, str]:
     results = []
 
     for host, port in STUN_SERVERS:
@@ -113,6 +137,10 @@ def discover_public_endpoint(sock: socket.socket, quiet: bool = False) -> tuple[
     if not results:
         raise RuntimeError("all STUN servers failed")
 
-    nat_type = "symmetric" if len(results) >= 2 and results[0].port != results[1].port else "cone-type"
+    nat_type = (
+        NATType.SYMMETRIC
+        if len(results) >= 2 and results[0].port != results[1].port
+        else NATType.CONE
+    )
 
     return results[0], nat_type
