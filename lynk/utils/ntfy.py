@@ -5,6 +5,8 @@ import socket
 import urllib.error
 import urllib.request
 from typing import Optional
+from lynk.structs import SocketAddress
+from lynk.enums import NATType
 
 log = logging.getLogger("p2p")
 
@@ -16,7 +18,7 @@ def channel_for(username: str) -> str:
     return f"p2p-{digest[:16]}"
 
 
-def ntfy_publish(topic: str, payload: dict, quiet: bool = False) -> None:
+def publish(topic: str, payload: dict) -> None:
     url = f"{NTFY_BASE}/{topic}"
 
     request = urllib.request.Request(
@@ -29,13 +31,10 @@ def ntfy_publish(topic: str, payload: dict, quiet: bool = False) -> None:
     with urllib.request.urlopen(request, timeout=10) as response:
         response.read()
 
-    if not quiet:
-        log.info("Published endpoint %s:%s", payload["ip"], payload["port"])
 
-
-def ntfy_get_latest_peer(
+def get_peer_socket(
     topic: str, expected_username: str
-) -> Optional[tuple[str, int]]:
+) -> Optional[tuple[SocketAddress, NATType]]:
     url = f"{NTFY_BASE}/{topic}/json?poll=1&since=latest"
 
     try:
@@ -53,7 +52,10 @@ def ntfy_get_latest_peer(
                     if payload.get("username") != expected_username:
                         continue
 
-                    return str(payload["ip"]), int(payload["port"])
+                    return (
+                        SocketAddress(payload["ip"], int(payload["port"])),
+                        NATType(payload["nat"]),
+                    )
 
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     continue

@@ -1,17 +1,10 @@
-import logging
-import random
-import socket
 import struct
-from dataclasses import dataclass
-from typing import Optional
-from enum import Enum
-
-log = logging.getLogger("p2p")
-
-STUN_SERVERS = [
-    ("stun.l.google.com", 19302),
-    ("stun.cloudflare.com", 3478),
-]
+import socket
+from structs import SocketAddress
+from enums import NATType
+import typing as t
+import random
+import logging
 
 STUN_MAGIC_COOKIE = 0x2112A442
 STUN_BINDING_REQUEST = 0x0001
@@ -22,16 +15,12 @@ ATTR_XOR_MAPPED_ADDRESS = 0x0020
 
 STUN_FAMILY_IPV4 = 0x01
 
+STUN_SERVERS = [
+    ("stun.l.google.com", 19302),
+    ("stun.cloudflare.com", 3478),
+]
 
-class NATType(int, Enum):
-    SYMMETRIC = 0
-    CONE = 1
-
-
-@dataclass
-class StunResult:
-    ip: str
-    port: int
+log = logging.getLogger("p2p")
 
 
 def build_stun_binding_request(transaction_id: bytes) -> bytes:
@@ -42,7 +31,7 @@ def build_stun_binding_request(transaction_id: bytes) -> bytes:
 
 def extract_mapped_address_from_stun_response(
     data: bytes, transaction_id: bytes
-) -> Optional[StunResult]:
+) -> t.Optional[SocketAddress]:
     if len(data) < 20:
         return None
 
@@ -82,7 +71,7 @@ def extract_mapped_address_from_stun_response(
             address = xor_address ^ STUN_MAGIC_COOKIE
             ip = socket.inet_ntoa(struct.pack("!I", address))
 
-            return StunResult(ip, port)
+            return SocketAddress(ip, port)
 
         elif (
             attr_type == ATTR_MAPPED_ADDRESS
@@ -91,7 +80,7 @@ def extract_mapped_address_from_stun_response(
         ):
             port = struct.unpack("!H", value[2:4])[0]
             ip = socket.inet_ntoa(value[4:8])
-            mapped_address = StunResult(ip, port)
+            mapped_address = SocketAddress(ip, port)
 
         offset += 4 + attr_length
         offset += (4 - attr_length % 4) % 4
@@ -99,7 +88,7 @@ def extract_mapped_address_from_stun_response(
     return mapped_address
 
 
-def stun_query(sock: socket.socket, host: str, port: int) -> StunResult:
+def stun_query(sock: socket.socket, host: str, port: int) -> SocketAddress:
     transaction_id = bytes(random.getrandbits(8) for _ in range(12))
     request = build_stun_binding_request(transaction_id)
     server_ip = socket.gethostbyname(host)
@@ -120,16 +109,11 @@ def stun_query(sock: socket.socket, host: str, port: int) -> StunResult:
         sock.settimeout(old_timeout)
 
 
-def discover_public_endpoint(
-    sock: socket.socket, quiet: bool = False
-) -> tuple[StunResult, str]:
+def discover_public_socket(sock: socket.socket) -> tuple[SocketAddress, NATType]:
     results = []
-
     for host, port in STUN_SERVERS:
         try:
             result = stun_query(sock, host, port)
-            if not quiet:
-                log.info("STUN %s:%d -> %s:%d", host, port, result.ip, result.port)
             results.append(result)
         except (socket.timeout, OSError, RuntimeError) as exc:
             log.warning("STUN %s:%d failed: %s", host, port, exc)
