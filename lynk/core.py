@@ -52,7 +52,11 @@ class Lynk:
 
         while True:
             try:
-                peer_addr, peer_nat = get_peer_socket(peer_ntfy_topic, peer_username)
+                peer_info = get_peer_socket(peer_ntfy_topic, peer_username)
+                if peer_info is None:
+                    continue
+
+                peer_addr, peer_nat = peer_info
                 log.info(f"Peer address is {own_addr.ip}:{own_addr.port}")
                 break
             except Exception as e:
@@ -94,5 +98,10 @@ class Lynk:
         return Lynk(sock, me, peer)
 
     def __init__(self, sock: socket.socket, me: NTFYPeerInfo, peer: NTFYPeerInfo):
-        self.me = me
-        self.peer = peer
+        self._sock = sock
+        self._me = me
+        self._peer = peer
+
+    @property
+    def udp_socket(self) -> socket.socket:
+        return self._sock
